@@ -26,23 +26,41 @@ class SkillInfo(BaseModel):
     name: str
     version: str
     description: str
+    skill_type: Literal["api", "workflow", "tool"]
     phase: str
+    capabilities: list[str]
+    match_rules: dict[str, Any]
     risk_level: Literal["low", "medium", "high"]
     requires_approval: bool
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
 
 
-class ExecutionStep(BaseModel):
+class PlanStep(BaseModel):
     step_index: int
     phase: str
     skill_name: str
+    reason: str
+    required_context: list[str] = Field(default_factory=list)
+    requires_approval: bool = False
+
+
+class ExecutionStep(BaseModel):
+    step_index: int
+    agent_name: str
+    phase: str
+    skill_name: str
     status: StepStatus
+    thought: str
+    action: str
+    observation: str
     input: dict[str, Any]
     output: dict[str, Any] | None = None
     error: str | None = None
     retry_count: int = 0
     duration_ms: int
+    loaded_context_keys: list[str] = Field(default_factory=list)
+    estimated_tokens: int = 0
     created_at: str
 
 
@@ -53,7 +71,7 @@ class TaskDetail(BaseModel):
     customer_type: str
     priority: str
     status: TaskStatus
-    plan: list[str]
+    plan: list[PlanStep]
     final_output: dict[str, Any] | None = None
     approval_payload: dict[str, Any] | None = None
     steps: list[ExecutionStep]
@@ -64,5 +82,5 @@ class TaskDetail(BaseModel):
 class TaskCreated(BaseModel):
     id: str
     status: TaskStatus
-    plan: list[str]
+    plan: list[PlanStep]
     next_action: str

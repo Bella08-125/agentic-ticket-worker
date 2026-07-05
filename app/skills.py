@@ -18,7 +18,10 @@ class SkillDefinition:
     name: str
     version: str
     description: str
+    skill_type: str
     phase: str
+    capabilities: list[str]
+    match_rules: dict[str, Any]
     risk_level: str
     requires_approval: bool
     input_schema: dict[str, Any]
@@ -30,7 +33,10 @@ class SkillDefinition:
             name=self.name,
             version=self.version,
             description=self.description,
+            skill_type=self.skill_type,  # type: ignore[arg-type]
             phase=self.phase,
+            capabilities=self.capabilities,
+            match_rules=self.match_rules,
             risk_level=self.risk_level,  # type: ignore[arg-type]
             requires_approval=self.requires_approval,
             input_schema=self.input_schema,
@@ -66,29 +72,11 @@ def policy_lookup(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("simulate_transient_failure") and payload.get("attempt") == 0:
         raise TransientSkillError("policy service timeout, retry with same context")
 
-    category = payload["triage"]["category"]
-    policies = {
-        "general_consultation": [
-            "优先回答商品、育儿、门店服务相关问题。",
-            "不确定内容需要给出人工客服转接建议。",
-        ],
-        "refund_request": [
-            "退款和赔偿类动作需要人工审批后才能承诺。",
-            "先收集订单号、购买渠道、问题照片和用户诉求。",
-        ],
-        "health_risk": [
-            "健康风险场景不得给出诊断结论。",
-            "建议用户及时咨询医生，并同步人工客服跟进。",
-        ],
-        "complaint": [
-            "投诉类场景需要安抚、记录证据并升级主管确认。",
-            "不得承诺超出政策范围的补偿。",
-        ],
-    }
+    context = payload["context"]
     return {
-        "loaded_context": policies.get(category, policies["general_consultation"]),
-        "context_strategy": "progressive_context_by_triage_category",
-        "source": "mock_policy_book/v1",
+        "loaded_context": context["loaded_context"],
+        "context_strategy": context["context_strategy"],
+        "source": context["source"],
     }
 
 
@@ -139,7 +127,10 @@ class SkillRegistry:
                     name="ticket_triage",
                     version="1.0.0",
                     description="Classify customer ticket category, urgency, and summary.",
+                    skill_type="workflow",
                     phase="understand",
+                    capabilities=["understand_ticket", "classify_ticket"],
+                    match_rules={"always": True},
                     risk_level="low",
                     requires_approval=False,
                     input_schema={"customer_message": "str", "customer_type": "str", "priority": "str"},
@@ -150,10 +141,13 @@ class SkillRegistry:
                     name="policy_lookup",
                     version="1.0.0",
                     description="Load only the policy snippets needed for the current triage category.",
+                    skill_type="api",
                     phase="context",
+                    capabilities=["load_policy_context", "retrieve_policy"],
+                    match_rules={"requires": ["triage.category"]},
                     risk_level="low",
                     requires_approval=False,
-                    input_schema={"triage": "dict", "simulate_transient_failure": "bool"},
+                    input_schema={"triage": "dict", "context": "dict", "simulate_transient_failure": "bool"},
                     output_schema={"loaded_context": "list[str]", "context_strategy": "str"},
                     handler=policy_lookup,
                 ),
@@ -161,7 +155,10 @@ class SkillRegistry:
                     name="escalation_decision",
                     version="1.0.0",
                     description="Decide whether the planned action needs human approval.",
+                    skill_type="workflow",
                     phase="risk_control",
+                    capabilities=["decide_escalation", "risk_control"],
+                    match_rules={"requires": ["task.customer_type", "triage.category"]},
                     risk_level="medium",
                     requires_approval=False,
                     input_schema={"task": "dict", "triage": "dict", "policy": "dict"},
@@ -172,7 +169,10 @@ class SkillRegistry:
                     name="reply_draft",
                     version="1.0.0",
                     description="Draft a customer reply from approved context and policy.",
+                    skill_type="tool",
                     phase="act",
+                    capabilities=["draft_reply", "compose_customer_message"],
+                    match_rules={"requires": ["policy.loaded_context", "approval"]},
                     risk_level="medium",
                     requires_approval=True,
                     input_schema={"task": "dict", "triage": "dict", "policy": "dict", "approval": "dict | null"},
@@ -183,7 +183,10 @@ class SkillRegistry:
                     name="crm_update_mock",
                     version="1.0.0",
                     description="Mock a CRM write to demonstrate tool side-effect boundaries.",
+                    skill_type="tool",
                     phase="act",
+                    capabilities=["write_crm_record", "record_resolution"],
+                    match_rules={"requires": ["task_id", "reply", "decision"]},
                     risk_level="high",
                     requires_approval=True,
                     input_schema={"task_id": "str", "reply": "dict", "decision": "dict"},
@@ -198,3 +201,9 @@ class SkillRegistry:
 
     def get(self, name: str) -> SkillDefinition:
         return self._skills[name]
+
+    def find_by_capability(self, capability: str) -> SkillDefinition:
+        for skill in self._skills.values():
+            if capability in skill.capabilities:
+                return skill
+        raise KeyError(f"no skill supports capability: {capability}")

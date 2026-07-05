@@ -5,7 +5,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from app.models import ApprovalRequest, TaskCreate
+from app.context import ContextBundle, ContextManager
+from app.memory import MemoryStore
+from app.models import ApprovalRequest, PlanStep, TaskCreate
+from app.planner import SupervisorAgent
 from app.skills import SkillRegistry, TransientSkillError
 from app.storage import Storage, dumps, loads
 
@@ -15,14 +18,25 @@ def now_iso() -> str:
 
 
 class AgentExecutor:
-    def __init__(self, storage: Storage, registry: SkillRegistry):
+    def __init__(
+        self,
+        storage: Storage,
+        registry: SkillRegistry,
+        supervisor: SupervisorAgent | None = None,
+        context_manager: ContextManager | None = None,
+        memory: MemoryStore | None = None,
+    ):
         self.storage = storage
         self.registry = registry
+        self.supervisor = supervisor or SupervisorAgent(registry)
+        self.context_manager = context_manager or ContextManager()
+        self.memory = memory or MemoryStore()
 
     def create_task(self, request: TaskCreate) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
         created_at = now_iso()
-        plan = ["ticket_triage", "policy_lookup", "escalation_decision", "reply_draft", "crm_update_mock"]
+        plan = self.supervisor.plan(request)
+        plan_payload = [step.model_dump() for step in plan]
         task = {
             "id": task_id,
             "title": request.title,
@@ -30,7 +44,7 @@ class AgentExecutor:
             "customer_type": request.customer_type,
             "priority": request.priority,
             "status": "running",
-            "plan": plan,
+            "plan": plan_payload,
             "final_output": None,
             "approval_payload": None,
             "created_at": created_at,
@@ -51,7 +65,7 @@ class AgentExecutor:
                     request.customer_type,
                     request.priority,
                     "running",
-                    dumps(plan),
+                    dumps(plan_payload),
                     None,
                     None,
                     created_at,
@@ -59,7 +73,7 @@ class AgentExecutor:
                 ),
             )
 
-        self._run_until_approval_or_done(task)
+        self._run_until_approval_or_done(task, plan)
         detail = self.get_task(task_id)
         return {
             "id": task_id,
@@ -106,14 +120,20 @@ class AgentExecutor:
             "steps": [
                 {
                     "step_index": step["step_index"],
+                    "agent_name": step["agent_name"],
                     "phase": step["phase"],
                     "skill_name": step["skill_name"],
                     "status": step["status"],
+                    "thought": step["thought"],
+                    "action": step["action"],
+                    "observation": step["observation"],
                     "input": loads(step["input_json"], {}),
                     "output": loads(step["output_json"]),
                     "error": step["error"],
                     "retry_count": step["retry_count"],
                     "duration_ms": step["duration_ms"],
+                    "loaded_context_keys": loads(step["loaded_context_keys_json"], []),
+                    "estimated_tokens": step["estimated_tokens"],
                     "created_at": step["created_at"],
                 }
                 for step in steps
@@ -122,29 +142,49 @@ class AgentExecutor:
             "updated_at": row["updated_at"],
         }
 
-    def _run_until_approval_or_done(self, task: dict[str, Any]) -> None:
-        scratch: dict[str, Any] = {"task": self._task_view(task)}
+    def _run_until_approval_or_done(self, task: dict[str, Any], plan: list[PlanStep]) -> None:
+        scratch: dict[str, Any] = {
+            "task": self._task_view(task),
+            "memory": self.memory.recall_customer_profile(task["customer_type"]),
+        }
         try:
-            scratch["triage"] = self._call_skill(task["id"], 1, "ticket_triage", self._task_view(task))
+            scratch["triage"] = self._call_skill(
+                task_id=task["id"],
+                plan_step=plan[0],
+                payload={**self._task_view(task), "memory": scratch["memory"]},
+                thought="Understand the ticket before loading any policy context.",
+                action="Call ticket_triage skill.",
+                context_bundle=ContextBundle(keys=["memory:customer_profile"], data={}, estimated_tokens=8),
+            )
+
+            policy_context = self.context_manager.prepare("context", scratch)
             scratch["policy"] = self._call_skill(
-                task["id"],
-                2,
-                "policy_lookup",
-                {
+                task_id=task["id"],
+                plan_step=plan[1],
+                payload={
                     "triage": scratch["triage"],
+                    "context": policy_context.data,
                     "simulate_transient_failure": "模拟失败" in task["customer_message"],
                 },
+                thought="Load policy snippets only after triage identifies the task category.",
+                action="Call policy_lookup skill with progressive context.",
+                context_bundle=policy_context,
             )
+
             scratch["decision"] = self._call_skill(
-                task["id"],
-                3,
-                "escalation_decision",
-                {
+                task_id=task["id"],
+                plan_step=plan[2],
+                payload={
                     "task": self._task_view(task),
                     "triage": scratch["triage"],
                     "policy": scratch["policy"],
+                    "memory": scratch["memory"],
                 },
+                thought="Check whether this task can proceed automatically or needs human approval.",
+                action="Call escalation_decision skill.",
+                context_bundle=ContextBundle(keys=["memory:customer_profile"], data={}, estimated_tokens=8),
             )
+
             if scratch["decision"]["requires_approval"]:
                 self._update_task(
                     task["id"],
@@ -156,43 +196,53 @@ class AgentExecutor:
                     },
                 )
                 return
+
             scratch["approval"] = {"approved": True, "reviewer": "auto_low_risk_policy"}
-            self._finish_task(task["id"], task, scratch)
+            self._finish_task(task["id"], task, scratch, plan)
         except Exception as exc:
             self._update_task(task["id"], status="failed", final_output={"error": str(exc)})
 
     def _continue_after_approval(self, task: dict[str, Any]) -> None:
         steps_by_skill = {step["skill_name"]: step["output"] for step in task["steps"] if step["output"]}
+        plan = [PlanStep(**step) for step in task["plan"]]
         scratch = {
             "task": self._task_view(task),
+            "memory": self.memory.recall_customer_profile(task["customer_type"]),
             "triage": steps_by_skill["ticket_triage"],
             "policy": steps_by_skill["policy_lookup"],
             "decision": steps_by_skill["escalation_decision"],
             "approval": task["approval_payload"],
         }
-        self._finish_task(task["id"], task, scratch)
+        self._finish_task(task["id"], task, scratch, plan)
 
-    def _finish_task(self, task_id: str, task: dict[str, Any], scratch: dict[str, Any]) -> None:
+    def _finish_task(self, task_id: str, task: dict[str, Any], scratch: dict[str, Any], plan: list[PlanStep]) -> None:
+        act_context = self.context_manager.prepare("act", scratch)
         reply = self._call_skill(
-            task_id,
-            4,
-            "reply_draft",
-            {
+            task_id=task_id,
+            plan_step=plan[3],
+            payload={
                 "task": self._task_view(task),
                 "triage": scratch["triage"],
                 "policy": scratch["policy"],
                 "approval": scratch["approval"],
+                "context": act_context.data,
             },
+            thought="Generate the customer response from approved policy and action context.",
+            action="Call reply_draft skill.",
+            context_bundle=act_context,
         )
         crm = self._call_skill(
-            task_id,
-            5,
-            "crm_update_mock",
-            {
+            task_id=task_id,
+            plan_step=plan[4],
+            payload={
                 "task_id": task_id,
                 "reply": reply,
                 "decision": scratch["decision"],
+                "context": act_context.data,
             },
+            thought="Record the result through a mock tool after approval boundaries are satisfied.",
+            action="Call crm_update_mock skill.",
+            context_bundle=act_context,
         )
         self._update_task(
             task_id,
@@ -202,11 +252,20 @@ class AgentExecutor:
                 "decision": scratch["decision"],
                 "reply": reply,
                 "crm": crm,
+                "memory": scratch["memory"],
             },
         )
 
-    def _call_skill(self, task_id: str, step_index: int, skill_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        skill = self.registry.get(skill_name)
+    def _call_skill(
+        self,
+        task_id: str,
+        plan_step: PlanStep,
+        payload: dict[str, Any],
+        thought: str,
+        action: str,
+        context_bundle: ContextBundle,
+    ) -> dict[str, Any]:
+        skill = self.registry.get(plan_step.skill_name)
         max_attempts = 2
         started = time.perf_counter()
         last_error: str | None = None
@@ -215,15 +274,17 @@ class AgentExecutor:
                 output = skill.handler({**payload, "attempt": attempt})
                 self._record_step(
                     task_id=task_id,
-                    step_index=step_index,
-                    phase=skill.phase,
-                    skill_name=skill_name,
+                    plan_step=plan_step,
                     status="success",
                     input_payload=payload,
                     output_payload=output,
                     error=None,
                     retry_count=attempt,
                     duration_ms=int((time.perf_counter() - started) * 1000),
+                    thought=thought,
+                    action=action,
+                    observation=f"{plan_step.skill_name} completed successfully.",
+                    context_bundle=context_bundle,
                 )
                 return output
             except TransientSkillError as exc:
@@ -235,50 +296,61 @@ class AgentExecutor:
 
         self._record_step(
             task_id=task_id,
-            step_index=step_index,
-            phase=skill.phase,
-            skill_name=skill_name,
+            plan_step=plan_step,
             status="failed",
             input_payload=payload,
             output_payload=None,
             error=last_error or "unknown skill error",
             retry_count=max_attempts - 1,
             duration_ms=int((time.perf_counter() - started) * 1000),
+            thought=thought,
+            action=action,
+            observation=f"{plan_step.skill_name} failed after retry policy.",
+            context_bundle=context_bundle,
         )
-        raise RuntimeError(f"{skill_name} failed: {last_error}")
+        raise RuntimeError(f"{plan_step.skill_name} failed: {last_error}")
 
     def _record_step(
         self,
         task_id: str,
-        step_index: int,
-        phase: str,
-        skill_name: str,
+        plan_step: PlanStep,
         status: str,
         input_payload: dict[str, Any],
         output_payload: dict[str, Any] | None,
         error: str | None,
         retry_count: int,
         duration_ms: int,
+        thought: str,
+        action: str,
+        observation: str,
+        context_bundle: ContextBundle,
     ) -> None:
         with self.storage.connection() as conn:
             conn.execute(
                 """
                 INSERT INTO execution_steps (
-                    task_id, step_index, phase, skill_name, status, input_json,
-                    output_json, error, retry_count, duration_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    task_id, step_index, agent_name, phase, skill_name, status,
+                    thought, action, observation, input_json, output_json, error,
+                    retry_count, duration_ms, loaded_context_keys_json, estimated_tokens, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
-                    step_index,
-                    phase,
-                    skill_name,
+                    plan_step.step_index,
+                    "TicketWorkerAgent",
+                    plan_step.phase,
+                    plan_step.skill_name,
                     status,
+                    thought,
+                    action,
+                    observation,
                     dumps(input_payload),
                     dumps(output_payload) if output_payload is not None else None,
                     error,
                     retry_count,
                     duration_ms,
+                    dumps(context_bundle.keys),
+                    context_bundle.estimated_tokens,
                     now_iso(),
                 ),
             )

@@ -38,19 +38,26 @@ class Storage:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT NOT NULL,
                     step_index INTEGER NOT NULL,
+                    agent_name TEXT NOT NULL DEFAULT 'TicketWorkerAgent',
                     phase TEXT NOT NULL,
                     skill_name TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    thought TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL DEFAULT '',
+                    observation TEXT NOT NULL DEFAULT '',
                     input_json TEXT NOT NULL,
                     output_json TEXT,
                     error TEXT,
                     retry_count INTEGER NOT NULL,
                     duration_ms INTEGER NOT NULL,
+                    loaded_context_keys_json TEXT NOT NULL DEFAULT '[]',
+                    estimated_tokens INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES tasks(id)
                 );
                 """
             )
+            self._ensure_execution_step_columns(conn)
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -61,6 +68,22 @@ class Storage:
             conn.commit()
         finally:
             conn.close()
+
+    def _ensure_execution_step_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(execution_steps)").fetchall()
+        }
+        migrations = {
+            "agent_name": "ALTER TABLE execution_steps ADD COLUMN agent_name TEXT NOT NULL DEFAULT 'TicketWorkerAgent'",
+            "thought": "ALTER TABLE execution_steps ADD COLUMN thought TEXT NOT NULL DEFAULT ''",
+            "action": "ALTER TABLE execution_steps ADD COLUMN action TEXT NOT NULL DEFAULT ''",
+            "observation": "ALTER TABLE execution_steps ADD COLUMN observation TEXT NOT NULL DEFAULT ''",
+            "loaded_context_keys_json": "ALTER TABLE execution_steps ADD COLUMN loaded_context_keys_json TEXT NOT NULL DEFAULT '[]'",
+            "estimated_tokens": "ALTER TABLE execution_steps ADD COLUMN estimated_tokens INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                conn.execute(statement)
 
 
 def dumps(value: Any) -> str:
