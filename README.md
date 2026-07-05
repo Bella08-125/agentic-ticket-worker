@@ -111,6 +111,7 @@ Current coverage includes:
 - Skill Registry metadata.
 - Low-risk automatic completion.
 - Refund/complaint human approval.
+- High-priority general task approval.
 - Approval continuation.
 - Invalid approval conflict.
 - Transient failure retry.
@@ -124,6 +125,7 @@ Current coverage includes:
 - [Architecture](docs/architecture.md)
 - [Demo Script](docs/demo-script.md)
 - [AI Coding Log](docs/ai-coding-log.md)
+- [Agent Repo Review Report](docs/agent-repo-review-report.md)
 
 ## Next Improvements
 

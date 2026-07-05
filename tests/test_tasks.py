@@ -71,6 +71,25 @@ def test_refund_task_waits_for_approval(client: TestClient) -> None:
     assert len(detail["steps"]) == 3
 
 
+def test_high_priority_general_task_waits_for_approval(client: TestClient) -> None:
+    response = client.post(
+        "/tasks",
+        json={
+            "title": "高优先级门店咨询",
+            "customer_message": "请尽快确认门店培训安排。",
+            "customer_type": "normal",
+            "priority": "high",
+        },
+    )
+    created = response.json()
+    assert created["status"] == "waiting_approval"
+
+    detail = client.get(f"/tasks/{created['id']}").json()
+    decision = next(step for step in detail["steps"] if step["skill_name"] == "escalation_decision")
+    assert decision["output"]["risk_level"] == "high"
+    assert "高优先级" in decision["output"]["reason"]
+
+
 def test_approval_continues_and_finishes_task(client: TestClient) -> None:
     created = client.post(
         "/tasks",

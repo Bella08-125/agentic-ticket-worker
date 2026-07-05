@@ -82,13 +82,23 @@ def policy_lookup(payload: dict[str, Any]) -> dict[str, Any]:
 
 def escalation_decision(payload: dict[str, Any]) -> dict[str, Any]:
     category = payload["triage"]["category"]
+    high_urgency = payload["triage"]["urgency"] == "high" or payload["task"]["priority"] == "high"
     high_risk = category in {"refund_request", "health_risk", "complaint"}
     vip = payload["task"]["customer_type"] == "vip"
-    requires_approval = high_risk or vip
+    requires_approval = high_risk or high_urgency or vip
+    risk_level = "high" if high_risk or high_urgency else "medium" if vip else "low"
+    if high_risk:
+        reason = "高风险退款/投诉/健康工单需要人工确认"
+    elif high_urgency:
+        reason = "高优先级工单需要人工确认后再执行"
+    elif vip:
+        reason = "VIP 工单需要人工确认"
+    else:
+        reason = "低风险咨询可自动回复"
     return {
         "requires_approval": requires_approval,
-        "risk_level": "high" if high_risk else "medium" if vip else "low",
-        "reason": "高风险/退款/投诉/健康或 VIP 工单需要人工确认" if requires_approval else "低风险咨询可自动回复",
+        "risk_level": risk_level,
+        "reason": reason,
     }
 
 
@@ -161,7 +171,7 @@ class SkillRegistry:
                     match_rules={"requires": ["task.customer_type", "triage.category"]},
                     risk_level="medium",
                     requires_approval=False,
-                    input_schema={"task": "dict", "triage": "dict", "policy": "dict"},
+                    input_schema={"task": "dict", "triage": "dict", "policy": "dict", "memory": "dict"},
                     output_schema={"requires_approval": "bool", "risk_level": "str", "reason": "str"},
                     handler=escalation_decision,
                 ),
